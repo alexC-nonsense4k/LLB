@@ -2,6 +2,7 @@ import random
 import math
 import numpy as np
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, AdamW, get_linear_schedule_with_warmup
 import transformers
 import torch
@@ -35,14 +36,20 @@ def create_prompt(example):
     answer = "Cannot Find Answer"
   else:
     answer = example['answers']["text"][0]
-  example['prediction'] = f"CONTEXT:\n{example['context']}\n\nQUESTION:\n{example['question']}\n\nANSWER:{answer}"
+  example['prediction'] = f"CONTEXT:\n{example['context']}\n\nQUESTION:\n{example['question']}\n\nANSWER: {answer}"
   return example
 
 
-
-
-
-
+def create_labels(example):
+    prefix_len=len(tokenizer(f"CONTEXT:\n{example['context']}\n\nQUESTION:\n{example['question']}\n\nANSWER:")['input_ids'])
+    if len(example['answers']["text"]) < 1:
+        answer = "Cannot Find Answer"
+    else:
+        answer = example['answers']["text"][0]
+    answer_len=len(tokenizer(answer)['input_ids'])
+    labels=[-100]*prefix_len+tokenizer(answer)['input_ids']+[-100]*(len(example['input_ids'])-prefix_len-answer_len)
+    example['labels']=labels
+    return labels
 
 
 mapped_qa_dataset=qa_dataset
@@ -55,7 +62,23 @@ for train in mapped_qa_dataset['train']:
     if  len(tokenizer(train['prediction'])['input_ids'])>max_len:
         max_len=len(tokenizer(train['prediction'])['input_ids'])
 
-mapped_qa_dataset = mapped_qa_dataset.map(lambda samples: tokenizer(samples['prediction'],padding='max_length',max_length=max_len), batched=True)
+mapped_qa_dataset = mapped_qa_dataset.map(lambda samples: tokenizer(samples['prediction'],padding='max_length',max_length=max_len,add_special_tokens=True), batched=True)
+
+train_labels=[]
+
+
+for train in mapped_qa_dataset['train']:
+    prefix_len=len(tokenizer(f"CONTEXT:\n{train['context']}\n\nQUESTION:\n{train['question']}\n\nANSWER:")['input_ids'])
+    if len(train['answers']["text"]) < 1:
+        answer = "Cannot Find Answer"
+    else:
+        answer = train['answers']["text"][0]
+    answer_len=len(tokenizer(answer)['input_ids'])
+    labels=[-100]*prefix_len+tokenizer(answer)['input_ids']+[-100]*(len(train['input_ids'])-prefix_len-answer_len)
+    train_labels.append(labels)
+
+
+
 
 model = AutoModelForCausalLM.from_pretrained(
     modelPath,
@@ -76,16 +99,16 @@ config = LoraConfig(
     ],
 )
 
-epochs=1
+epochs=3
 peft_model = get_peft_model(model, config)
 
-optimizer=AdamW(model.parameters(),lr=2e-5,eps=1e-9)
+optimizer=AdamW(model.parameters(),lr=1e-3,eps=1e-9)
 
 scheduler=get_linear_schedule_with_warmup(optimizer,num_warmup_steps=0,num_training_steps=epochs*len(mapped_qa_dataset['train']))
 
 
 seed_val = 42
-batch_size=2
+batch_size=1
 
 random.seed(seed_val)
 np.random.seed(seed_val)
@@ -97,7 +120,7 @@ device='cuda'
 total_t0 = time.time()
 
 
-for i in range(1):
+for i in range(epochs):
     print('======== Epoch {:} / {:} ========'.format(i + 1, epochs))
     print('Training...')
     t0 = time.time()
@@ -120,10 +143,14 @@ for i in range(1):
                        return_dict=True)
         logits=result.logits.to('cpu')
         b_input_ids=b_input_ids.to('cpu')
-        softmax_tensor = torch.nn.functional.softmax(logits, dim=-1)
+        b_input_mask=b_input_mask.to('cpu')
+        b_labels=train_labels[j:end]
+        b_labels=torch.tensor(b_labels)
         loss_fct = CrossEntropyLoss()
-        loss=loss_fct(logits.view(-1,51200),b_input_ids.view(-1))
+        #loss=(F.cross_entropy(logits.view(-1,51200),b_input_ids.view(-1),reduction='none')*b_input_mask.view(-1)).sum()/b_input_mask.sum()
+        loss=loss_fct(logits.view(-1,51200),b_labels.view(-1))
         total_train_loss += loss.item()
+        print(f'batch loss:{loss.item()}')
         loss.backward()
         torch.nn.utils.clip_grad_norm_(peft_model.parameters(), 1.0)
         optimizer.step()
